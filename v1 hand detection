@@ -1,0 +1,571 @@
+import os
+import time
+import threading
+import subprocess
+import re
+import math
+
+import numpy as np
+import cv2
+
+# Prefer OpenGL; it's fast on your box. (It will fall back if not available.)
+os.environ.setdefault("LIBFREENECT2_PIPELINE", "gl")
+
+from freenect2 import Device, FrameType, NoFrameReceivedError
+
+# --------- MediaPipe Pose only ----------
+import mediapipe as mp
+
+mp_pose = mp.solutions.pose
+PoseLandmark = mp_pose.PoseLandmark
+
+PROJECTOR_NAME_PART = os.environ.get("PROJECTOR_SCREEN_NAME", "HDMI")
+
+# --------- depth-based person ROI params ----------
+MIN_PERSON_DEPTH_MM = 600    # ignore stuff closer than 0.6 m
+MAX_PERSON_DEPTH_MM = 4000   # up to 4 m away
+MIN_PERSON_AREA = 2000       # min contour area to consider a person
+ROI_PADDING_PX = 40          # extra padding around bbox
+
+CROP_TARGET_W = 512          # pose input size (cropped person)
+CROP_TARGET_H = 288
+
+# ---------- display pick ----------
+def pick_projector():
+    out = subprocess.check_output(["xrandr"], text=True)
+    for line in out.splitlines():
+        m = re.search(r"^(\S+)\s+connected\s+(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+        if m and PROJECTOR_NAME_PART.lower() in m.group(1).lower():
+            name = m.group(1)
+            w = int(m.group(2))
+            h = int(m.group(3))
+            x = int(m.group(4))
+            y = int(m.group(5))
+            return name, x, y, w, h
+
+    # fallback: last connected
+    connected = [
+        re.findall(r"^(\S+)\s+connected\s+(\d+)x(\d+)\+(\d+)\+(\d+)", l)
+        for l in out.splitlines()
+    ]
+    connected = [t[0] for t in connected if t]
+    if not connected:
+        raise RuntimeError("No connected displays via xrandr")
+    name, w, h, x, y = connected[-1][0], int(connected[-1][1]), int(connected[-1][2]), int(connected[-1][3]), int(connected[-1][4])
+    return name, x, y, w, h
+
+
+# ---------- visuals ----------
+def letterbox(img_bgr, W, H):
+    ih, iw = img_bgr.shape[:2]
+    if ih == 0 or iw == 0:
+        return np.zeros((H, W, 3), np.uint8)
+    s = min(W / iw, H / ih)
+    nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+    out = np.zeros((H, W, 3), np.uint8)
+    r = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    x0, y0 = (W - nw) // 2, (H - nh) // 2
+    out[y0:y0 + nh, x0:x0 + nw] = r
+    return out
+
+
+def ir_to_vis_bgr(ir):
+    """
+    Convert Kinect IR frame (float) to an 8-bit BGR visualization.
+    """
+    arr = ir.astype(np.float32)
+    valid = arr > 0
+    if not np.any(valid):
+        return np.zeros((arr.shape[0], arr.shape[1], 3), np.uint8)
+    vals = arr[valid]
+    lo = np.percentile(vals, 1.0)
+    hi = np.percentile(vals, 99.0)
+    if hi <= lo:
+        lo, hi = float(vals.min()), float(max(vals.max(), vals.min() + 1))
+    scaled = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    vis = (scaled * 255.0).astype(np.uint8)
+    return cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+
+# ---------- depth-based person ROI ----------
+def find_person_roi(depth_mm):
+    """
+    Use depth to find the largest blob (likely the person) in a depth range.
+    Returns (x0, y0, x1, y1) in depth/IR coords, or None.
+    """
+    if depth_mm is None:
+        return None
+
+    d = depth_mm.astype(np.float32)
+    mask = (d > MIN_PERSON_DEPTH_MM) & (d < MAX_PERSON_DEPTH_MM)
+    mask_u8 = (mask.astype(np.uint8) * 255)
+
+    if not np.any(mask_u8):
+        return None
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    best_cnt = None
+    best_area = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > best_area and area >= MIN_PERSON_AREA:
+            best_area = area
+            best_cnt = cnt
+
+    if best_cnt is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(best_cnt)
+    x0 = max(0, x - ROI_PADDING_PX)
+    y0 = max(0, y - ROI_PADDING_PX)
+    x1 = min(depth_mm.shape[1], x + w + ROI_PADDING_PX)
+    y1 = min(depth_mm.shape[0], y + h + ROI_PADDING_PX)
+
+    return (x0, y0, x1, y1)
+
+
+# ---------- hand region prediction from pose ----------
+def predict_hand_boxes_from_pose(ir_bgr, roi_rect, pose_landmarks):
+    """
+    Use elbow + wrist landmarks to predict where hands should be.
+    Returns list of dicts: { 'side': 'left'/'right', 'x1','y1','x2','y2' }
+    Coordinates in full IR image space.
+    """
+    x0, y0, x1, y1 = roi_rect
+    cw, ch = x1 - x0, y1 - y0
+    if cw <= 0 or ch <= 0:
+        return []
+
+    hands = []
+
+    full_h, full_w = ir_bgr.shape[:2]
+    # For each side, compute predicted hand center and a box around it.
+    for side, elbow_enum, wrist_enum in [
+        ("left",  PoseLandmark.LEFT_ELBOW,  PoseLandmark.LEFT_WRIST),
+        ("right", PoseLandmark.RIGHT_ELBOW, PoseLandmark.RIGHT_WRIST),
+    ]:
+        elbow_lm = pose_landmarks.landmark[elbow_enum]
+        wrist_lm = pose_landmarks.landmark[wrist_enum]
+
+        # Skip if not visible enough
+        if elbow_lm.visibility < 0.4 or wrist_lm.visibility < 0.4:
+            continue
+
+        # Pose gives normalized coords (0..1) relative to input crop image.
+        # Our pose input is the resized ROI (CROP_TARGET_W x CROP_TARGET_H),
+        # but the relative normalized coords still map linearly to ROI.
+        # Map from normalized to ROI pixels:
+        ex_roi = elbow_lm.x * cw
+        ey_roi = elbow_lm.y * ch
+        wx_roi = wrist_lm.x * cw
+        wy_roi = wrist_lm.y * ch
+
+        # Then to full-frame coords
+        ex_full = x0 + ex_roi
+        ey_full = y0 + ey_roi
+        wx_full = x0 + wx_roi
+        wy_full = y0 + wy_roi
+
+        # Forearm vector
+        vx = wx_full - ex_full
+        vy = wy_full - ey_full
+        length = math.hypot(vx, vy)
+        if length < 1e-3:
+            continue
+
+        # Predict hand center a bit beyond wrist
+        extend_factor = 0.35  # how far beyond the wrist (in forearm lengths)
+        cx = wx_full + extend_factor * vx
+        cy = wy_full + extend_factor * vy
+
+        # Box size proportional to forearm length
+        box_half = int(max(30, min(0.6 * length, 160)))  # clamp size
+        x1h = int(cx - box_half)
+        y1h = int(cy - box_half)
+        x2h = int(cx + box_half)
+        y2h = int(cy + box_half)
+
+        # Clamp to image
+        x1h = max(0, x1h)
+        y1h = max(0, y1h)
+        x2h = min(full_w, x2h)
+        y2h = min(full_h, y2h)
+
+        if x2h <= x1h or y2h <= y1h:
+            continue
+
+        hands.append({
+            "side": side,
+            "x1": x1h,
+            "y1": y1h,
+            "x2": x2h,
+            "y2": y2h,
+        })
+
+    return hands
+
+
+# ---------- analyze a hand ROI for open vs closed ----------
+def classify_hand_open_closed_from_roi(ir_bgr, hand_box):
+    """
+    Heuristic: threshold IR in predicted hand box, extract largest contour,
+    use convexity defects to estimate if the hand is open (many finger gaps)
+    or closed (fist, few or no gaps).
+
+    Returns: "OPEN", "CLOSED", or "UNKNOWN"
+    """
+    x1, y1, x2, y2 = hand_box["x1"], hand_box["y1"], hand_box["x2"], hand_box["y2"]
+    roi_bgr = ir_bgr[y1:y2, x1:x2]
+    if roi_bgr.size == 0:
+        return "UNKNOWN"
+
+    roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+    h, w = roi_gray.shape
+    if h < 25 or w < 25:
+        # too small to say anything
+        return "UNKNOWN"
+
+    # Slight blur to reduce noise
+    roi_gray_blur = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+
+    # Adaptive threshold: Otsu
+    _, roi_bin = cv2.threshold(
+        roi_gray_blur, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Depending on IR polarity, background might be white or black.
+    # Make sure we keep the dominant foreground as white by checking which is bigger.
+    white_ratio = np.mean(roi_bin == 255)
+    if white_ratio > 0.8:  # probably inverted
+        roi_bin = cv2.bitwise_not(roi_bin)
+
+    # Morph close to fill gaps
+    kernel = np.ones((3, 3), np.uint8)
+    roi_bin = cv2.morphologyEx(roi_bin, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(roi_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return "UNKNOWN"
+
+    # largest contour = likely the hand blob
+    contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    if area < (w * h * 0.02):
+        # too tiny to be a real hand
+        return "UNKNOWN"
+
+    # convexity defects
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        # can't compute defects -> treat as closed-ish
+        return "CLOSED"
+
+    defects = cv2.convexityDefects(contour, hull)
+    if defects is None:
+        return "CLOSED"
+
+    # Count "deep" defects: these correspond to gaps between fingers.
+    deep_defects = 0
+    for i in range(defects.shape[0]):
+        s, e, f, depth = defects[i, 0]
+        # depth is *256 (fixed point). Convert to pixel-ish scale:
+        depth_px = depth / 256.0
+        if depth_px > min(h, w) * 0.07:  # gap depth threshold (~7% of ROI size)
+            deep_defects += 1
+
+    # Heuristic thresholds:
+    # - 2 or more deep defects => open hand (multiple finger gaps)
+    # - 0 or 1 => closed (fist) or pointing
+    if deep_defects >= 2:
+        return "OPEN"
+    else:
+        return "CLOSED"
+
+
+# ---------- keystone UI ----------
+HANDLE_R = 22
+LINE_THICK = 3
+OVERLAY_ALPHA = 0.25
+CENTER_RECT_SCALE = 0.10
+
+
+class KeystoneEditor:
+    def __init__(self, W, H):
+        self.W, self.H = W, H
+        self.edit_mode = True
+        self.corners = np.zeros((4, 2), np.float32)
+        self._init_small_centered_quad()
+        self.drag_idx = -1
+        self.H_mat = None
+
+    def _init_small_centered_quad(self):
+        w = int(self.W * CENTER_RECT_SCALE)
+        h = int(self.H * CENTER_RECT_SCALE)
+        x0 = (self.W - w) // 2
+        y0 = (self.H - h) // 2
+        self.corners[:] = np.array(
+            [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]],
+            np.float32
+        )
+        self.H_mat = None
+
+    def compute_H(self, src_w, src_h):
+        src = np.array([[0, 0], [src_w, 0], [src_w, src_h], [0, src_h]], np.float32)
+        dst = self.corners.astype(np.float32)
+        return cv2.getPerspectiveTransform(src, dst)
+
+    def on_mouse(self, event, x, y, flags, param):
+        if not self.edit_mode:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            diffs = self.corners - np.array([x, y], np.float32)
+            d2 = (diffs ** 2).sum(axis=1)
+            idx = int(np.argmin(d2))
+            if d2[idx] <= (HANDLE_R * HANDLE_R * 4):
+                self.drag_idx = idx
+        elif event == cv2.EVENT_MOUSEMOVE and self.drag_idx >= 0:
+            x = max(0, min(self.W - 1, x))
+            y = max(0, min(self.H - 1, y))
+            self.corners[self.drag_idx] = [x, y]
+            self.H_mat = None
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.drag_idx = -1
+
+    def draw_overlay(self, canvas):
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, 0), (self.W - 1, self.H - 1), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, OVERLAY_ALPHA, canvas, 1 - OVERLAY_ALPHA, 0, canvas)
+        pts = self.corners.astype(int)
+        for i in range(4):
+            cv2.line(canvas, tuple(pts[i]), tuple(pts[(i + 1) % 4]),
+                     (0, 255, 255), LINE_THICK, cv2.LINE_AA)
+        for (px, py) in pts:
+            cv2.circle(canvas, (px, py), HANDLE_R, (0, 140, 255), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (px, py), HANDLE_R, (25, 25, 25), 2, cv2.LINE_AA)
+        cv2.putText(canvas,
+                    "Drag corners  |  's' start/stop  |  'q'/Esc quit",
+                    (16, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+# ---------- threaded frame drain ----------
+class LatestFrames:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ir = None
+        self.depth = None
+        self.running = True
+
+
+def drain_thread(dev: Device, store: LatestFrames):
+    while store.running:
+        try:
+            ftype, frame = dev.get_next_frame(timeout=0.0)
+        except NoFrameReceivedError:
+            time.sleep(0.001)
+            continue
+        if ftype is None:
+            continue
+        with store.lock:
+            if ftype == FrameType.Ir:
+                store.ir = frame
+            elif ftype == FrameType.Depth:
+                store.depth = frame
+            # Drop Color frames.
+
+
+# ---------- main loop ----------
+def main():
+    name, X, Y, W, H = pick_projector()
+    print(f"[display] {name} @ {W}x{H}+{X}+{Y}")
+
+    win = "KINECT_IR_POSE_HAND_ESTIMATED"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.resizeWindow(win, W, H)
+    cv2.moveWindow(win, X, Y)
+    cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+
+    editor = KeystoneEditor(W, H)
+    cv2.setMouseCallback(win, editor.on_mouse)
+
+    dev = Device()
+    with dev.running():
+        store = LatestFrames()
+        t = threading.Thread(target=drain_thread, args=(dev, store), daemon=True)
+        t.start()
+
+        last_show = 0
+        target_dt = 1.0 / 60.0
+
+        with mp_pose.Pose(
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4
+        ) as pose:
+
+            last_roi = None
+
+            try:
+                while True:
+                    # Grab latest frames
+                    with store.lock:
+                        ir_frame = store.ir
+                        depth_frame = store.depth
+                        store.ir = None
+                        store.depth = None
+
+                    if ir_frame is None:
+                        if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+                            break
+                        continue
+
+                    ir_arr = ir_frame.to_array()
+                    ir_bgr = ir_to_vis_bgr(ir_arr)
+                    full_h, full_w = ir_bgr.shape[:2]
+
+                    depth_mm = depth_frame.to_array() if depth_frame is not None else None
+
+                    # ---------- Find / track person ROI using depth ----------
+                    roi = None
+                    if depth_mm is not None:
+                        roi = find_person_roi(depth_mm)
+
+                    if roi is None and last_roi is not None:
+                        roi = last_roi
+
+                    if roi is None:
+                        # Fallback: center crop
+                        cx, cy = full_w // 2, full_h // 2
+                        rw, rh = full_w // 2, full_h // 2
+                        x0 = max(0, cx - rw // 2)
+                        y0 = max(0, cy - rh // 2)
+                        x1 = min(full_w, x0 + rw)
+                        y1 = min(full_h, y0 + rh)
+                        roi = (x0, y0, x1, y1)
+                    else:
+                        last_roi = roi
+
+                    x0, y0, x1, y1 = roi
+                    cw, ch = x1 - x0, y1 - y0
+
+                    # Draw ROI border
+                    cv2.rectangle(ir_bgr, (x0, y0), (x1, y1),
+                                  (90, 90, 90), 2, cv2.LINE_AA)
+
+                    hand_states = []
+
+                    if cw > 40 and ch > 40:
+                        # Pose on cropped person
+                        crop = ir_bgr[y0:y1, x0:x1]
+                        crop_resized = cv2.resize(
+                            crop, (CROP_TARGET_W, CROP_TARGET_H),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                        crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
+                        pose_result = pose.process(crop_rgb)
+
+                        if pose_result.pose_landmarks:
+                            # Draw simple skeleton (lines between key joints)
+                            for conn in mp_pose.POSE_CONNECTIONS:
+                                i0, i1 = conn
+                                lm0 = pose_result.pose_landmarks.landmark[i0]
+                                lm1 = pose_result.pose_landmarks.landmark[i1]
+                                X0 = int(x0 + lm0.x * cw)
+                                Y0 = int(y0 + lm0.y * ch)
+                                X1_ = int(x0 + lm1.x * cw)
+                                Y1_ = int(y0 + lm1.y * ch)
+                                cv2.line(ir_bgr, (X0, Y0), (X1_, Y1_),
+                                         (255, 255, 255), 2, cv2.LINE_AA)
+
+                            # Predict where hands should be based on elbow+wrist
+                            hand_boxes = predict_hand_boxes_from_pose(
+                                ir_bgr, roi, pose_result.pose_landmarks
+                            )
+
+                            # For each predicted hand region, classify open/closed
+                            for hb in hand_boxes:
+                                state = classify_hand_open_closed_from_roi(ir_bgr, hb)
+
+                                # Draw big box + label
+                                color = (0, 255, 0) if state == "OPEN" else \
+                                        (0, 0, 255) if state == "CLOSED" else \
+                                        (0, 255, 255)
+
+                                x1h, y1h, x2h, y2h = hb["x1"], hb["y1"], hb["x2"], hb["y2"]
+                                cv2.rectangle(ir_bgr, (x1h, y1h), (x2h, y2h),
+                                              color, 3, cv2.LINE_AA)
+                                label = f"{hb['side'].upper()} {state}"
+                                cv2.putText(ir_bgr, label,
+                                            (x1h, y1h - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.8, color, 2, cv2.LINE_AA)
+
+                                hand_states.append(label)
+
+                    hud = " | ".join(hand_states) if hand_states else "No hands classified"
+
+                    composed = letterbox(ir_bgr, W, H)
+                    cv2.putText(composed,
+                                "Kinect IR + Depth | Pose skeleton | Geometry-based hand ROI + OPEN/CLOSED heuristic",
+                                (16, 32),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(composed, hud,
+                                (16, 70),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
+                    # Keystone / projection
+                    if editor.edit_mode:
+                        canvas = np.zeros((H, W, 3), np.uint8)
+                        editor.draw_overlay(canvas)
+                    else:
+                        if editor.H_mat is None:
+                            editor.H_mat = editor.compute_H(W, H)
+                        warped = cv2.warpPerspective(
+                            composed,
+                            editor.H_mat,
+                            (W, H),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0
+                        )
+                        mask = np.zeros((H, W), np.uint8)
+                        pts = editor.corners.astype(np.int32)
+                        cv2.fillConvexPoly(mask, pts, 255)
+                        warped[mask == 0] = 0
+                        canvas = warped
+
+                    now = time.time()
+                    if now - last_show < target_dt:
+                        time.sleep(max(0, target_dt - (now - last_show)))
+                    cv2.imshow(win, canvas)
+                    last_show = time.time()
+
+                    # ---------- key handling ----------
+                    k = cv2.waitKey(1) & 0xFF
+                    if k in (27, ord('q')):
+                        break
+                    elif k == ord('s'):
+                        editor.edit_mode = not editor.edit_mode
+                        editor.H_mat = None
+
+            finally:
+                store.running = False
+                t.join(timeout=0.2)
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
